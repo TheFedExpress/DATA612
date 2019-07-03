@@ -1,0 +1,2 @@
+The "genome-scores" dataset is hosted on datadotworld.  For full reproducibilty please message me for the api key.
+The data can also be downloaded here: https://www.dropbox.com/l/scl/AAAwxfocFe9ahRfmdVxv4kdihTEsFLBO-Cg
