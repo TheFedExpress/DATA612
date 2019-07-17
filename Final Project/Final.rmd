@@ -1,0 +1,634 @@
+---
+title: "Goodreads Recommender"
+author: "Peter Goodridge"
+date: "July 16, 2019"
+output: 
+  html_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+```
+
+
+## Introduction
+
+The "goodbooks-10k" dataset consists of 6 million ratings over 50 thousand users and 10 thousand books.  It was sourced from Goodreads.  The ratings data is supplemented with tags and book metadata, leading itself to a hybrid collaborative filtering and content-based recommender.  This data was supplemented with text blurbs pulled using the Wikipedia API describing each book.
+
+We will build 3 different recommenders based on each dataset:
+
+1. A standard ALS recommender using the ratings
+2. Perform LDA on the text content to create a content recommender
+3. Use seq2seq with tags to create content recommender
+
+The final recommendations will be a mixed hybrid, a union of these 3 sets.
+
+### Load Data
+
+These files are relatively small so we'll load from github, then copy to spark.  We downsample the ratings dataset that will be passed to spark.  This will only affect the ALS model and shouldn't have a big influence because we group by user.  Even on a 16 core 32 gig machine, this dataset is unweildly for cross validation and anything more than a simple model fit.
+
+
+```{r}
+library(tidyverse)
+library(sparklyr)
+library(kableExtra)
+library(keras)
+set.seed(7) #many of our models are stochastic
+
+conf <- spark_config()
+conf$`sparklyr.cores.local` <- 4
+conf$`sparklyr.shell.driver-memory` <- "8G"
+conf$spark.memory.fraction <- 0.9
+spark_conn <- spark_connect('local', config = conf)
+
+
+
+
+fp <- 'https://raw.githubusercontent.com/TheFedExpress/DATA612/master/Final%20Project/tidy_words.csv'
+words_local <- read_csv(fp)
+book_to_id <- read_csv('https://raw.githubusercontent.com/TheFedExpress/DATA612/master/Final%20Project/book_to_id.csv')
+tags <- read_csv('https://raw.githubusercontent.com/zygmuntz/goodbooks-10k/master/book_tags.csv')
+tag_descs <- read_csv('https://raw.githubusercontent.com/zygmuntz/goodbooks-10k/master/tags.csv')
+books <- read_csv('https://raw.githubusercontent.com/zygmuntz/goodbooks-10k/master/books.csv')
+ratings <- read_csv('https://raw.githubusercontent.com/zygmuntz/goodbooks-10k/master/ratings.csv')
+
+ratings_small <- ratings %>%
+  group_by(user_id) %>%
+  sample_frac(size = .5)
+ratings_sc <- copy_to(spark_conn, ratings_small, overwrite = T)
+descs <- copy_to(spark_conn, words_local, overwrite = T)
+```
+
+### Basic Data Exploration
+
+```{r}
+ratings %>%
+  group_by(book_id) %>%
+  summarize(read_count = n()) %>%
+  ggplot() + geom_bar(aes(x = book_id, y = read_count), stat = 'identity') +
+  labs(title = 'Long Tail of Preferences', y = 'Book Count', x = 'Book') +
+  theme(
+    axis.text.x = element_blank()
+  ) +
+  theme_minimal()
+```
+
+This is part of the justification for our hybrid model.  The two content-based pieces should be able to recommend niche titles in the long tail.
+
+```{r}
+ratings %>%
+  group_by(user_id) %>%
+  summarize(read_count = n()) %>%
+  ggplot() + geom_bar(aes(x = reorder(user_id, read_count), y = read_count), stat = 'identity') +
+  labs(title = 'User Frequency', y = 'Book Count', x = 'User') +
+  theme(
+    axis.text.x = element_blank()
+  ) +
+  theme_minimal()
+```
+
+In this dataset, we won't really suffer from the cold start problem with the healthy number of ratings each user has.  However, if deployed, our content-based nodes would be especially useful for new users.
+
+## LDA Model
+
+Book titles were used in the wikipedia api to find relvent pages.  Not all book titles could be found.  Unpopular books and those not written in English were naturally filtered out, but over 85% of all titles were located.  The data was collected in Python and preproccesed using the gensim library.  This made it easier to stem words and remove words that occured in over 50% of the documents.  These clean documents were exported into a csv for processing with the Spark ml_lda function.
+
+### LDA
+
+The parameters required a bit of tuning.  With default parameters, nearly all the weight was concentrated in two topics.  After looking at gensim's defaults and a bit of trial and error, the topic distribution was much improved. (two sections below)
+
+```{r}
+features <- descs %>%
+  ft_tokenizer("text", "tokens") %>%
+  ft_count_vectorizer("tokens", "features")
+
+
+vec_model <- ml_pipeline( ft_tokenizer(spark_conn, "text", "tokens"), ft_count_vectorizer(spark_conn, "tokens", "features")) %>%
+  ml_fit(descs)
+
+vocab_key <- ml_vocabulary(ml_stage(vec_model, 'count_vectorizer')) %>% data.frame() %>%
+  rownames_to_column('termIndices') %>%
+  rename('word' = '.') %>%
+  mutate(termIndices = as.integer(termIndices),
+    termIndices = termIndices - 1
+  )
+
+
+lda_mod <-  ml_lda(features, k = 50, optimizer = 'online', learning_offset = 1, learning_decay = .5,
+                   doc_concentration = .0005, optimize_doc_concentration = TRUE)
+```
+
+
+### Word Distribution by Topic
+
+Printing the topics takes a bit of work since the "ml_describe_topics" function returns token indexes, not actual words.  Examining two of our most popular topics, we see that they are coherent, but wont't always translate to user tastes. 
+
+
+```{r}
+topic_descriptions <- ml_describe_topics(lda_mod) %>%
+  collect() %>%
+  unnest(termIndices, termWeights) %>%
+  mutate(topic = topic + 1)
+
+topic_descriptions$termIndices <- unlist(topic_descriptions$termIndices)
+topic_descriptions <- topic_descriptions %>% left_join(vocab_key, 'termIndices')
+
+filter(topic_descriptions, topic %in% c(6, 28)) %>%
+  head(20) %>%
+  kable() %>% kable_styling(bootstrap_options = 'striped')
+```
+
+### Topic Distribution by Document
+
+Each document will have a length 50 vector (50 is the number of topics we chose), which can be considered its hidden dimensions.  These will be used to build a similarity matrix for each document so we want a distribution that's not too uniform, nor too top heavy.
+
+```{r}
+do_topic_temp <- ml_transform(lda_mod, features) %>%
+  select(topicDistribution) %>%
+  collect()
+
+
+lda_features <- do.call(rbind, do_topic_temp$topicDistribution) 
+colnames(lda_features) <- paste('topic', 1:50)
+
+
+lda_long <- lda_features %>%
+  data.frame() %>%
+  gather(topic, value) 
+
+
+lda_long$book_index <- 1:nrow(do_topic_temp)
+
+lda_long %>% 
+  filter(value >= .15) %>%
+  group_by(topic) %>%
+  summarise(n_books = n()) %>%
+  arrange(desc(n_books)) %>%
+  head(15) %>%
+  ggplot() + geom_bar(aes(x = topic, y = n_books), stat = 'identity') +
+  labs(title = 'Top 15 Frequent Topics') +
+  coord_flip ()+
+  theme_minimal()
+
+```
+
+This is a little more top-heavy than we would like, but still adequate.
+
+### Book Similarities
+
+We build are similarity matrix using pearson correlation, as it is the simplest to implement.  Next, we match books with titles and get an idea of the coherence of our model by examining correlation between the first 20 titles.
+
+```{r}
+lda_sim <- lda_features %>% as.matrix() %>% t() %>% cor 
+lda_subset <- lda_sim[1:20, 1:20]
+lda_sim <- lda_sim %>%
+  data.frame() %>%
+  rownames_to_column('row_id') %>%
+  mutate(row_id = as.integer(row_id)) %>%
+  inner_join(book_to_id, c('row_id' = 'X1')) %>%
+  select(-words)
+
+row_to_book <- book_to_id %>%
+  inner_join(books, 'book_id')
+
+
+
+
+
+library(corrplot)
+
+first_20 <- row_to_book %>% arrange(book_id) %>% head(20) %>% mutate(title = str_sub(title,1,25))
+
+colnames(lda_subset) <- first_20$title
+rownames(lda_subset) <- first_20$title
+
+corrplot(lda_subset, order = 'hclus')
+```
+
+
+### Procuding Recommendations
+
+For both the seq2seq and LDA content-based recommendations, we'll use the following simple algorithm:
+
+1. Choose a user
+2. Find the top 10 rated books by that user
+3. Find the similarity vector (the similarity of all books) for each of the 10 top
+4. Take the average of the similarity vectors
+5. Sort the similarity vectors and pick the top n
+
+One of the drawbacks of this method is that producing recommendations for all users at once is too computationally expensive to be feasible. As a result, typical recommender evaluation metrics a difficult to produce for this algorithm.
+
+```{r}
+#correlation_matrix <- similarity_input %>%
+#  ml_corr()
+  
+user_ratings <- ratings %>%
+  group_by(user_id) %>%
+  summarise(n_ratings = n())
+
+
+top_ratings <- function(named_user, ratings_df, n){
+  ratings_df %>%
+    filter(user_id == named_user) %>%
+    arrange(desc(rating)) %>%
+    head(n)
+}
+
+get_rated_books <- function(named_user, ratings_df){
+  ratings_df %>%
+    filter(user_id == named_user)
+}
+
+calc_user_lda <- function(user_id, ratings_df, similarity_df, k){
+  similarity_df %>%
+    inner_join(top_ratings(user_id, ratings_df, 10), 'book_id') %>%
+    select(-c(book_id, rating, row_id, user_id)) %>%
+    summarise_all(mean) %>%
+    gather(row_index, rating) %>%
+    mutate(row_index = str_sub(row_index, 2) %>% as.numeric()) %>%
+    inner_join(book_to_id, c( 'row_index' = 'X1')) %>%
+    anti_join(get_rated_books(user_id, ratings_df), 'book_id') %>% #remove books the user has rated 
+    select(book_id, rating) %>%
+    drop_na() %>%
+    inner_join(books, 'book_id') %>%
+    select(book_id, title, rating) %>%
+    arrange(desc(rating)) %>%
+    head(k)
+}
+
+calc_user_lda(1, ratings, lda_sim, 20) %>%
+  kable() %>% kable_styling(bootstrap_options = 'striped')
+
+```
+
+There isn't an obvious pattern here, but I'm also not an avid reader.
+
+## seq2seq Model
+
+The tags were preprocessed, then fed into a simple neural network using only dense layers.  The architecture was inspired by this article:
+https://towardsdatascience.com/creating-a-hybrid-content-collaborative-movie-recommender-using-deep-learning-cc8b431618af
+
+The idea is that the middle layer, the encoding layer, becomes a low dimensional representation of the set of tags for a particular book.  Related tags are compressed into the same dimension, similar to the way SVD creates latent dimensions.  For instance, the model should learn that "fantasy" and "sci-fi fantasy" are related because they have a number of co-occurences.  
+
+### Transforming Tag Data
+
+The tag data is supplied in a bag-of-words-like format.  We want to normalize the "count" to control for popularity and cast it into a wide format.
+
+The following transformations are performed:
+
+1. Create metadata lookup table
+2. Filter low-information tags
+3. TF-IDF scaling
+4. Normalize by book.  If we wanted to account for popularity this step would be removed
+5. Cast into wide form
+6. Log scaling to correct highly skewed distribution
+
+
+```{r}
+
+tags_test <- tags %>%
+  filter(goodreads_book_id <= 100) %>%
+  inner_join(tag_descs, 'tag_id') %>%
+  inner_join(books, 'goodreads_book_id') %>%
+  select(goodreads_book_id, tag_id, tag_name, title) %>%
+  arrange(goodreads_book_id, tag_id)
+
+tags_expanded <- tags %>%
+  inner_join(tag_descs, 'tag_id') %>%
+  inner_join(books, 'goodreads_book_id') %>%
+  select(goodreads_book_id, tag_id, tag_name, title, count) %>%
+  filter(str_detect(tag_name, '\\d{4,}') == FALSE & str_detect(tag_name, '\\w+') == TRUE
+         & str_detect(tag_name, 'book') == FALSE)
+
+mean_counts <- tags_expanded %>%
+  group_by(goodreads_book_id) %>%
+  summarise(mean_count = mean(count))
+
+tag_counts <- tags_expanded %>%
+  group_by(tag_id) %>%
+  summarise(freq = n()) %>%
+  mutate(idf_weight = log(10000/(freq + 1))) %>%
+  arrange(desc(freq)) %>%
+  filter(freq >= 500) %>%
+  select(idf_weight, tag_id)
+
+tags_fixed <- tags_expanded %>%
+  group_by(tag_id, goodreads_book_id) %>%
+  summarise(tag_count = sum(count)) %>%
+  ungroup() %>%
+  inner_join(tag_counts, 'tag_id') %>%
+  inner_join(mean_counts, 'goodreads_book_id') %>%
+  mutate(tag_count = (tag_count/mean_count) * idf_weight) %>%
+  inner_join(tag_descs, 'tag_id') %>%
+  inner_join(books, 'goodreads_book_id') %>%
+  select(tag_count, goodreads_book_id, tag_id, tag_name, title)
+
+max_tag <- tags_fixed %>% select(tag_id) %>% distinct() %>% nrow()
+max_count <- max(tags_fixed$tag_count, na.rm = TRUE)
+
+book_count <- tags_fixed %>% select(goodreads_book_id) %>% distinct %>% nrow()
+
+ggplot(tags_fixed) + geom_density(aes(x = log(tag_count))) + labs(title = 'Tag Count Raw')
+ggplot(tags_fixed) + geom_density(aes(x = log(tag_count))) + labs(title = 'Tag Count Logged')
+
+bag_of_words <- tags_fixed %>%
+  select(tag_id, tag_count, goodreads_book_id) %>%
+  mutate(tag_count = log(tag_count + 1)) %>%
+  spread(tag_id, tag_count) %>%
+  replace(., is.na(.), 0) %>%
+  arrange(goodreads_book_id) %>%
+  select(-goodreads_book_id) %>%
+  as.matrix ()
+```
+
+### Contstruct NN
+
+This is one of the possible areas for improvement, as my experience with deep learning is somewhat limited.  We use two mirrored sequences, with the encodings layer sandwhiched between them.  The idea is for the network to learn a 25 dimensional vector that describes the state of the 400+ dimensional tag vector and can reproduce it.  
+
+```{r}
+encoder <- keras_model_sequential(name = 'encoder') 
+encoder %>%
+  layer_dense(units = 256, activation = 'relu')%>%
+  layer_dropout(rate = .3) %>%
+  layer_dense(units = 128, activation = 'relu')%>%
+  layer_dropout(rate = .3) %>%
+  layer_dense(units = 64, activation = 'relu')%>%
+  layer_dense(units = 25,  activation = 'relu', name = 'tag_encodings')
+
+decoder <- keras_model_sequential()
+
+decoder %>%
+  layer_dense(units = 64, activation = 'relu', input_shape = c(25), name = 'embeddings_layer') %>%
+  layer_dense(units = 128, activation = 'relu')%>%
+  layer_dropout(rate = .3) %>%
+  layer_dense(units = 256, activation = 'relu')%>%
+  layer_dropout(rate = .3) %>%
+  layer_dense(units = max_tag) %>%
+  layer_activation('sigmoid')
+
+
+model <- keras_model_sequential()
+model %>%
+  encoder %>%
+  decoder %>%
+  keras::compile(loss = 'mse', optimizer = 'adam', metrics = c('mse'))
+
+model %>% fit( 
+  bag_of_words[1:8000, ], 
+  bag_of_words[1:8000, ], 
+  epochs = 5, 
+  batch_size = 10,
+  shuffle = FALSE,
+  verbose = FALSE,
+  validation_data = list(bag_of_words[8001:10000, ], bag_of_words[8001:10000, ])
+)
+```
+
+```{r}
+model_outputs <- get_layer(model, 'encoder') %>% get_layer('tag_encodings')
+intermediate_layer_model <- keras_model(inputs = encoder$input,
+                                        outputs = model_outputs$output)
+
+intermediate_output <- predict(intermediate_layer_model, bag_of_words)
+
+fixed_embeddings <- intermediate_output[, colSums(intermediate_output != 0) > 0]#vectors of all zeros provide no information and make similarity less accurate.
+```
+
+
+### Sanity Check
+
+Similar to the LDA model, we create a similarity matrix for all books using the 25 dimension encodings.  The first 20 books are examined to determine the coherence of the model.
+
+```{r}
+matrix_features <- fixed_embeddings %>% t() %>% cor()
+matrix_features_small <- matrix_features[1:20, 1:20]
+
+
+library(corrplot)
+
+ordered_books <- books %>% arrange(goodreads_book_id)
+first_20 <- ordered_books %>% arrange(goodreads_book_id) %>% head(20) %>% mutate(title = str_sub(title,1,20))
+
+colnames(matrix_features_small) <- first_20$title
+rownames(matrix_features_small) <- first_20$title
+
+corrplot(matrix_features_small)
+
+```
+
+This pattern is obvious, though it does help that there are so many Harry Potter Books.  The middle cluster consists of books related to travel and adventure.  Harry Potter being related to Lord of the Rings is also a good sign.
+
+### Recommendations
+
+Again similar to LDA, we produce recommendations using the similarity matrix and same algorithm.
+
+```{r}
+
+row_to_good_reads <- ordered_books %>%
+  rownames_to_column('row_id') %>%
+  mutate(row_id = as.integer(row_id)) %>%
+  select(row_id, goodreads_book_id)
+
+good_reads_lookup <- select(books, goodreads_book_id, book_id)
+
+book_simarilarity <- matrix_features %>%
+  data.frame() %>%
+  rownames_to_column('row_id') %>%
+  mutate(row_id = as.integer(row_id)) %>%
+  inner_join(row_to_good_reads, 'row_id') %>%
+  inner_join(books, 'goodreads_book_id') %>%
+  select(-goodreads_book_id)
+
+
+calc_user_tags <- function(user_id, ratings_df, similarity_df, k, n = 10){
+  
+  similarity_df %>%
+    inner_join(top_ratings(user_id, ratings_df, n), 'book_id') %>%
+    select(starts_with('X')) %>%
+    summarise_all(mean) %>%
+    gather(row_index, rating) %>%
+    mutate(row_index = str_sub(row_index, 2) %>% as.numeric()) %>%
+    inner_join(row_to_good_reads, c( 'row_index' = 'row_id')) %>%
+    inner_join(good_reads_lookup, 'goodreads_book_id') %>%
+    anti_join(get_rated_books(user_id, ratings_df), 'book_id') %>% #remove books the user has rated 
+    select(book_id, rating) %>%
+    drop_na() %>%
+    inner_join(books, 'book_id') %>%
+    select(book_id, title, rating) %>%
+    arrange(desc(rating)) %>%
+    head(k)
+}
+
+calc_user_tags(1, ratings, book_simarilarity, 20)%>%
+  kable() %>% kable_styling(bootstrap_options = 'striped')
+```
+
+
+## ALS Model
+
+Using a standard Spark ALS implementation, constructing a single model was easier than expected, but tuning on a grid wasn't practical when running Spark locally. 
+
+### Optimize Parameters
+
+Spark has built-in funtions for grid search, allowing us to easily optimize RMSE.  The dimensionality in the grid will be higher than when we were working with 100K ratings datasets.  The dimensionality of the users and books are an order of magnitude higher than they were in previous projects.
+
+```{r}
+estimator <- ml_pipeline(spark_conn) %>%
+  ml_als(rating_col = 'rating', user_col = 'user_id', item_col = 'book_id', max_iter = 10, cold_start_strategy = 'drop')  
+
+#als_grid <- list(als = list(rank = c(20, 30, 50), reg_param = c(.05, .1)))
+
+als_grid <- list(als = list(rank = c(20,30,50)))
+cv <- ml_cross_validator(
+  spark_conn, 
+  estimator = estimator,
+  evaluator = ml_regression_evaluator(spark_conn, label_col = 'rating'), 
+  estimator_param_maps = als_grid,
+  num_folds = 2
+)
+
+als_cv <- ml_fit(cv, ratings_sc)
+ml_validation_metrics(als_cv) %>% kable() %>% kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+This RMSE is similar to ALS implementations on other ratings datasets, such as movielens.  It could be because of the relatively low book dimensionality that the optimal rank is so low.
+
+### Metrics at K
+
+To assees, the practical quality of the ALS portion of our recommender, we'll look at precision and recall at a few levels of recommendations (10-30).  This will give us an idea of how quicly the quality drops off.  If the recall increases, but the precision stays level, we would be more comfortable at higher levels of K.
+
+```{r}
+for (k in 1:2){
+  metrics_at_k <- vector('list', length = 3)
+  for (i in 1:2){ 
+    temp_dfs <- vector('list', length = 2)
+    set.seed(42 + i)
+    partitioned_set <- ratings_sc %>%
+      sdf_random_split(training = .8, testing = .2) 
+    
+    als_mod <- partitioned_set[[1]] %>%
+      ml_als(rating_col = 'rating', user_col = 'user_id', item_col = 'book_id', max_iter = 10, rank = 20, reg_param = .1,
+             implicit_prefs = TRUE)
+    
+    recs <- ml_recommend(als_mod, type = 'item', k*10) %>%
+      full_join(partitioned_set[[2]], c('user_id', 'book_id'), suffix = c('_pred', '_act')) %>%
+      mutate(truth_cat = ifelse(is.na(rating_pred) == 1 & is.na(rating_act) == 0, 'FN', '')) %>%
+      mutate(truth_cat = ifelse(is.na(rating_pred) == 0 & is.na(rating_act) == 1, 'FP', truth_cat)) %>%
+      mutate(truth_cat = ifelse(is.na(rating_pred) == 0 & is.na(rating_act) == 0, 'TP', truth_cat)) %>%
+      group_by(truth_cat) %>%
+      summarise(tot_obs = n()) %>%
+      ungroup() %>%
+      collect()
+    
+    recs_cm <- recs %>%
+      spread(truth_cat, tot_obs) %>%
+      mutate(
+        precision = TP/(TP + FP),
+        recall = TP/(TP + FN),
+        F1 =  2*((precision*recall)/(precision + recall))
+      )
+    temp_dfs[[i]] <- recs_cm
+  }
+  summary_df <- bind_rows(temp_dfs) %>%
+    summarise_all(mean) %>%
+    add_column('k' = k*10)
+  metrics_at_k[[k]] <- summary_df
+}
+
+metrics_at_k %>%
+  bind_rows() %>% kable() %>% kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+In the first iteration, didn't use implicit prefs and the precision and recall were considerably lower.  This is somewhat surprising given that we have explicit ratings.  Our goal is to predict the books users will read, not optimize RMSE.  The confusion matrix statistics are more important; we will keep this parameter set to TRUE in our final recommender.
+
+### ALS Predictions
+
+Again with user #1, we produce our recommendations for the ALS model.
+
+```{r}
+final_als <- ml_als(ratings_sc, rating_col = 'rating', user_col = 'user_id', item_col = 'book_id', max_iter = 10, rank = 20, reg_param = .1, implicit_prefs = TRUE)
+
+
+calc_als <- function(model, user_id, k){
+
+  ml_recommend(final_als, type = 'item', k) %>%
+  
+    filter('user_id' == user_id) %>%
+    select(user_id, book_id, rating) %>%
+    collect() %>%
+    inner_join(books, 'book_id') %>%
+    select(book_id, title, rating) %>%
+    mutate(rating = rating)
+}
+
+calc_als(final_als, 1, 10)%>% kable() %>% kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+We now see how much of our total dataset was recommended.
+
+```{r}
+all_recs <- ml_recommend(als_mod, type = 'item', 10) %>%
+  group_by(book_id) %>%
+  summarize(book_count = n()) %>%
+  collect()
+
+ggplot(all_recs) + geom_bar(aes(x = reorder(book_id, book_count), y = book_count), stat = 'identity') +
+labs(title = 'Recommendations by Book', y = 'Book Count', x = 'Book') +
+theme(
+  axis.text.x = element_blank()
+) +
+theme_minimal()
+
+```
+
+## Mixed Hybrid
+
+We now bring everything together and create a function that will produce our final recommendations for a given user.  This will also show the recently rated books to give us and idea of the user's tastes.
+
+```{r}
+
+
+full_recs <- function (user_id, ratings_df, recs = 30){
+  lda_recs <- calc_user_lda(user_id, ratings, lda_sim, ceiling(recs/2)) %>%
+    add_column('source' = 'LDA')
+  tag_recs <- calc_user_tags(user_id, ratings, book_simarilarity, ceiling(recs/2)) %>%
+    add_column('source' = 'Tags')
+  als_recs <- calc_als(final_als, user_id, ceiling(recs/2)) %>%
+    add_column('source' = 'ALS')
+  
+  best_10 <- top_ratings(user_id, ratings_df, 10) %>%
+    inner_join(books, 'book_id') %>%
+    select(title, rating)
+  
+  recs <- rbind(lda_recs, tag_recs, als_recs) %>%
+    group_by(book_id) %>%
+    summarise(book_count = n) %>%
+    ungroup() %>%
+    arrange(desc(book_count), desc(rating)) %>%
+    head(recs)
+  
+  print(best_10)
+  return(recs)
+}
+
+full_recs(1, ratings)
+```
+
+### Conclusion
+
+The ALS model produced by far the best recommendatoins, but the other models are not without value.  ALS is going to recommend more of the same in most cases.  The two content-based models, even though not tuned, will provide the user with some nice under the radar titles.
+
+*Areas for improvement*
+
+- With better sources of text data describing the books, the room for improvement with the LDA piece is immense. 
+- Using more of the tags, and possibly passing a compressed tfidf matrix to Keras would yield better tag encodings.
+- Creating a more scalable algorithm for making the content recommendations.  The low hanging fruit would be to take advantage of parallelization, but I would think a ground up redesign might be necessary.
+
+
+### Sources
+
+1. https://towardsdatascience.com/creating-a-hybrid-content-collaborative-movie-recommender-using-deep-learning-cc8b431618af <br>
+2. https://github.com/rstudio/sparklyr/pull/1411 (extract vocabulary from LDA model) <br>
+3. https://www.mediawiki.org/wiki/API:Main_page <br>
+4. https://towardsdatascience.com/topic-modelling-in-python-with-nltk-and-gensim-4ef03213cd21
