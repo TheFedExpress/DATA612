@@ -26,7 +26,7 @@ The final recommendations will be a mixed hybrid, a union of these 3 sets.
 
 ### Load Data
 
-These files are relatively small so we'll load from github, then copy to spark.  We downsample the ratings dataset that will be passed to spark.  This will only affect the ALS model and shouldn't have a big influence because we group by user.  Even on a 16 core 32 gig machine, this dataset is unweildly for cross validation and anything more than a simple model fit.
+These files are relatively small so we'll load from github, then copy to spark.  We downsamle the data, as even on a 16 core 32 gig machine the 6 million rows is unweildly for cross validation and testing.
 
 
 ```{r}
@@ -37,8 +37,8 @@ library(keras)
 set.seed(7) #many of our models are stochastic
 
 conf <- spark_config()
-conf$`sparklyr.cores.local` <- 4
-conf$`sparklyr.shell.driver-memory` <- "8G"
+conf$`sparklyr.cores.local` <- 8
+conf$`sparklyr.shell.driver-memory` <- "16G"
 conf$spark.memory.fraction <- 0.9
 spark_conn <- spark_connect('local', config = conf)
 
@@ -52,9 +52,7 @@ tags <- read_csv('https://raw.githubusercontent.com/zygmuntz/goodbooks-10k/maste
 tag_descs <- read_csv('https://raw.githubusercontent.com/zygmuntz/goodbooks-10k/master/tags.csv')
 books <- read_csv('https://raw.githubusercontent.com/zygmuntz/goodbooks-10k/master/books.csv')
 ratings <- read_csv('https://raw.githubusercontent.com/zygmuntz/goodbooks-10k/master/ratings.csv')
-
 ratings_small <- ratings %>%
-  group_by(user_id) %>%
   sample_frac(size = .5)
 ratings_sc <- copy_to(spark_conn, ratings_small, overwrite = T)
 descs <- copy_to(spark_conn, words_local, overwrite = T)
@@ -329,8 +327,10 @@ max_count <- max(tags_fixed$tag_count, na.rm = TRUE)
 
 book_count <- tags_fixed %>% select(goodreads_book_id) %>% distinct %>% nrow()
 
-ggplot(tags_fixed) + geom_density(aes(x = log(tag_count))) + labs(title = 'Tag Count Raw')
-ggplot(tags_fixed) + geom_density(aes(x = log(tag_count))) + labs(title = 'Tag Count Logged')
+ggplot(tags_fixed) + geom_density(aes(x = log(tag_count))) + labs(title = 'Tag Count Raw') + 
+  theme_minimal()
+ggplot(tags_fixed) + geom_density(aes(x = log(tag_count))) + labs(title = 'Tag Count Logged') +
+  theme_minimal()
 
 bag_of_words <- tags_fixed %>%
   select(tag_id, tag_count, goodreads_book_id) %>%
@@ -349,23 +349,25 @@ This is one of the possible areas for improvement, as my experience with deep le
 ```{r}
 encoder <- keras_model_sequential(name = 'encoder') 
 encoder %>%
-  layer_dense(units = 256, activation = 'relu')%>%
+  layer_dense(units = 256, activation = 'relu', input_shape = c(max_tag))%>%
   layer_dropout(rate = .3) %>%
-  layer_dense(units = 128, activation = 'relu')%>%
+  layer_dense(units = 128, activation = 'relu', input_shape = c(256))%>%
   layer_dropout(rate = .3) %>%
-  layer_dense(units = 64, activation = 'relu')%>%
-  layer_dense(units = 25,  activation = 'relu', name = 'tag_encodings')
+  layer_dense(units = 64, activation = 'relu', input_shape = c(128))%>%
+  layer_dropout(rate = .3) %>%
+  layer_dense(units = 25,  activation = 'relu', name = 'tag_encodings', input_shape = c(64))
 
 decoder <- keras_model_sequential()
 
 decoder %>%
   layer_dense(units = 64, activation = 'relu', input_shape = c(25), name = 'embeddings_layer') %>%
-  layer_dense(units = 128, activation = 'relu')%>%
   layer_dropout(rate = .3) %>%
-  layer_dense(units = 256, activation = 'relu')%>%
+  layer_dense(units = 128, activation = 'relu', input_shape = c(64))%>%
   layer_dropout(rate = .3) %>%
-  layer_dense(units = max_tag) %>%
-  layer_activation('sigmoid')
+  layer_dense(units = 256, activation = 'relu', input_shape = c(128))%>%
+  layer_dropout(rate = .3) %>%
+  layer_dense(units = max_tag, input_shape = c(256)) %>%
+  layer_activation('sigmoid', input_shape = c(max_tag))
 
 
 model <- keras_model_sequential()
@@ -465,6 +467,7 @@ calc_user_tags(1, ratings, book_simarilarity, 20)%>%
 ```
 
 
+
 ## ALS Model
 
 Using a standard Spark ALS implementation, constructing a single model was easier than expected, but tuning on a grid wasn't practical when running Spark locally. 
@@ -496,11 +499,11 @@ This RMSE is similar to ALS implementations on other ratings datasets, such as m
 
 ### Metrics at K
 
-To assees, the practical quality of the ALS portion of our recommender, we'll look at precision and recall at a few levels of recommendations (10-30).  This will give us an idea of how quicly the quality drops off.  If the recall increases, but the precision stays level, we would be more comfortable at higher levels of K.
+To assees, the practical quality of the ALS portion of our recommender, we'll look at precision and recall at a few levels of recommendations (10-20).  This will give us an idea of how quicly the quality drops off.  If the recall increases, but the precision stays level, we would be more comfortable at higher levels of K.
 
 ```{r}
 for (k in 1:2){
-  metrics_at_k <- vector('list', length = 3)
+  metrics_at_k <- vector('list', length = 2)
   for (i in 1:2){ 
     temp_dfs <- vector('list', length = 2)
     set.seed(42 + i)
@@ -553,19 +556,17 @@ final_als <- ml_als(ratings_sc, rating_col = 'rating', user_col = 'user_id', ite
 calc_als <- function(model, user_id, k){
 
   ml_recommend(final_als, type = 'item', k) %>%
-  
+    select(book_id, user_id, rating) %>%
     filter('user_id' == user_id) %>%
-    select(user_id, book_id, rating) %>%
     collect() %>%
-    inner_join(books, 'book_id') %>%
-    select(book_id, title, rating) %>%
-    mutate(rating = rating)
+    select(user_id, book_id, rating) %>%
+    inner_join(books, 'book_id')
 }
 
-calc_als(final_als, 1, 10)%>% kable() %>% kable_styling(bootstrap_options = "striped", full_width = F)
+calc_als(final_als, 1, 10)
 ```
 
-We now see how much of our total dataset was recommended.
+We now see how much of our total dataset was recommended, though it should be noted that the downsampling has a minor affect on proportion of books appearing in recommendations.
 
 ```{r}
 all_recs <- ml_recommend(als_mod, type = 'item', 10) %>%
@@ -600,11 +601,12 @@ full_recs <- function (user_id, ratings_df, recs = 30){
   best_10 <- top_ratings(user_id, ratings_df, 10) %>%
     inner_join(books, 'book_id') %>%
     select(title, rating)
-  
-  recs <- rbind(lda_recs, tag_recs, als_recs) %>%
+  full_set <- rbind(lda_recs, tag_recs, als_recs)
+    recs <- full_set %>%
     group_by(book_id) %>%
-    summarise(book_count = n) %>%
+    summarise(book_count = n()) %>%
     ungroup() %>%
+    inner_join(full_set, 'book_id') %>%
     arrange(desc(book_count), desc(rating)) %>%
     head(recs)
   
@@ -612,7 +614,7 @@ full_recs <- function (user_id, ratings_df, recs = 30){
   return(recs)
 }
 
-full_recs(1, ratings)
+full_recs(1, ratings) %>% kable() %>% kable_styling(bootstrap_options = "striped", full_width = F)
 ```
 
 ### Conclusion
